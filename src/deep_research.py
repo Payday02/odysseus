@@ -9,6 +9,7 @@ when to stop.  Inspired by Alibaba's IterResearch approach.
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -18,6 +19,13 @@ from src.research_utils import strip_thinking, is_low_quality
 
 from src.goal_based_extractor import EXTRACTOR_SYSTEM
 from src.prompt_security import untrusted_context_message
+def _env_timeout(name: str, stock: int) -> int:
+    # Local patch: env-overridable read timeout for one LLM call site.
+    try:
+        return max(5, int(float(os.getenv(name, str(stock)))))
+    except (TypeError, ValueError):
+        return stock
+
 
 logger = logging.getLogger(__name__)
 
@@ -692,7 +700,7 @@ class DeepResearcher:
                 # (which gets 180s); a slow local model (e.g. a 20B served from
                 # LM Studio) routinely needs >60s for it. The old 60s cap timed
                 # out mid-stream and discarded the round's findings (#1551).
-                timeout=180,
+                timeout=_env_timeout('ODYSSEUS_TIMEOUT_RESEARCH', 180),
             )
         except Exception as e:
             logger.error(f"Synthesis failed: {e}")
@@ -749,7 +757,7 @@ class DeepResearcher:
                 [{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=self.max_report_tokens,
-                timeout=180,
+                timeout=_env_timeout('ODYSSEUS_TIMEOUT_RESEARCH', 180),
             )
 
             # If report is too short, ask the LLM to expand it
@@ -772,7 +780,7 @@ class DeepResearcher:
                     ],
                     temperature=0.4,
                     max_tokens=self.max_report_tokens,
-                    timeout=180,
+                    timeout=_env_timeout('ODYSSEUS_TIMEOUT_RESEARCH', 180),
                 )
                 if len(expanded.split()) > len(result.split()):
                     return expanded

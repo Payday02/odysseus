@@ -123,6 +123,7 @@ PLAN_MODE_READONLY_TOOLS = {
     "resolve_contact",
     "chat_with_model",
     "ask_teacher",
+    "vision",  # Local patch: read-only image analysis, like chat_with_model
 }
 
 

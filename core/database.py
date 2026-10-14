@@ -144,6 +144,11 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     if isinstance(dbapi_connection, sqlite3.Connection):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        # Local patch: WAL lets paginated history reads proceed while the agent
+        # persists large messages (no write-lock stalls on chat reload);
+        # busy_timeout waits on the lock instead of raising immediately.
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=10000")
         cursor.close()
 
 

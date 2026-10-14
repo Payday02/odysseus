@@ -333,7 +333,13 @@ def _resolve_request_workspace(request, raw_value) -> tuple:
     """
     requested = (raw_value or "").strip()
     if not requested:
-        return "", ""
+        # Local patch: fall back to a configured default workspace when the
+        # request/session didn't specify one, so a default survives restarts
+        # instead of needing /workspace set every new chat.
+        import os
+        requested = (os.getenv("ODYSSEUS_DEFAULT_WORKSPACE") or "").strip()
+        if not requested:
+            return "", ""
     from src.tool_security import owner_is_admin_or_single_user
     if not owner_is_admin_or_single_user(get_current_user(request)):
         return "", ""
@@ -2058,6 +2064,11 @@ def setup_chat_routes(
                                     # Wall-clock response time for the stats popup ("Time").
                                     last_metrics.setdefault("response_time", round(time.time() - _chat_start, 2))
                                     yield f'data: {json.dumps({"type": "metrics", "data": last_metrics})}\n\n'
+                                else:
+                                    # Local patch: forward unrecognized data events
+                                    # (stream_keepalive) so the browser watchdog
+                                    # stays quiet during long prefills.
+                                    yield chunk
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: error"):
@@ -2464,6 +2475,13 @@ def setup_chat_routes(
                                     if data.get("teacher") is True:
                                         _metrics_event["teacher"] = True
                                     yield f'data: {json.dumps(_metrics_event)}\n\n'
+                                else:
+                                    # Local patch: forward unrecognized data events
+                                    # (agent_prep, stream_keepalive). Stock dropped
+                                    # them here, so the browser never saw early
+                                    # progress and its 6-minute watchdog fired
+                                    # during long prefills.
+                                    yield chunk
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: "):

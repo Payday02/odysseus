@@ -7,10 +7,11 @@ Summarizes older messages via the same LLM, preserving key context.
 
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
 
-from src.model_context import get_context_length, estimate_tokens
+from src.model_context import get_context_length, estimate_tokens, get_real_context_ratio
 from src.llm_core import llm_call_async
 from src.endpoint_resolver import resolve_endpoint
 from core.models import ChatMessage
@@ -39,6 +40,13 @@ def _content_as_text(content: Any) -> str:
 
 COMPACT_THRESHOLD = 0.85  # Trigger compaction at 85% of context window
 SUMMARY_MAX_TOKENS = 1024
+def _env_timeout(name: str, stock: int) -> int:
+    # Local patch: env-overridable read timeout for one LLM call site.
+    try:
+        return max(5, int(float(os.getenv(name, str(stock)))))
+    except (TypeError, ValueError):
+        return stock
+
 SMALL_CONTEXT_LIMIT = 8192  # Models with context <= this get aggressive trimming
 
 # Cursor-style self-summarization prompt — produces structured, dense summaries
@@ -337,6 +345,11 @@ async def maybe_compact(
     """
     context_length = get_context_length(endpoint_url, model)
     used = estimate_tokens(messages)
+    # Local patch: scale by the measured estimate->real ratio (learned
+    # from overflow 400s) so compaction engages on an honest basis.
+    _real_ratio = get_real_context_ratio(endpoint_url, model)
+    if _real_ratio > 1.05:
+        used = int(used * _real_ratio)
     pct = (used / context_length) * 100 if context_length else 0
 
     if pct < COMPACT_THRESHOLD * 100:
@@ -399,7 +412,7 @@ async def maybe_compact(
             temperature=0.2,
             max_tokens=SUMMARY_MAX_TOKENS,
             headers=compact_headers,
-            timeout=30,
+            timeout=_env_timeout('ODYSSEUS_TIMEOUT_COMPACT', 30),
         )
     except Exception as e:
         logger.error(f"Compaction summary failed: {e}")

@@ -9,6 +9,7 @@ The LLM decides when to use tools by writing fenced code blocks.
 import asyncio
 import collections
 import json
+import os
 import re
 import time
 import logging
@@ -23,7 +24,13 @@ from src.llm_core import (
     _normalize_http_status,
     _normalize_usage_counts,
 )
-from src.model_context import estimate_tokens
+from src.model_context import (
+    estimate_tokens,
+    get_context_length,
+    get_real_context,
+    get_real_context_ratio,
+    learn_real_context,
+)
 from src.context_compactor import (
     apply_compaction_state,
     apply_compaction_state_for_session,
@@ -532,7 +539,7 @@ _DOMAIN_TOOL_MAP = {
     "notes_calendar_tasks": {"manage_notes", "manage_calendar", "manage_tasks"},
     "ui": {"ui_control"},
     "sessions": {"create_session", "list_sessions", "manage_session", "send_to_session", "search_chats"},
-    "files": {"bash", "python", "read_file", "write_file", "edit_file", "apply_patch", "todowrite", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs"},
+    "files": {"bash", "python", "read_file", "write_file", "edit_file", "apply_patch", "todowrite", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs", "vision"},  # Local patch: + vision
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
     "contacts": {"resolve_contact", "manage_contact"},
     "integrations": {"api_call"},
@@ -602,6 +609,12 @@ Fetch and read the text content of a SPECIFIC URL the user names (e.g. "check ex
 <file path>
 ```
 Read a file and return its contents.""",
+
+    "vision": """\
+```vision
+{"path": "<image file path>", "prompt": "<what to look for>"}
+```
+Analyze an image on disk with the configured vision model and return its description. Use for images whose contents you must reason about -- circuit screenshots, diagrams, charts, photos -- including attachment paths listed in the prompt. Optional "prompt" focuses the analysis (default: describe in detail). Paths are confined to the same roots as read_file. Defaults: no_thinking is true and max_tokens is 5000 -- override either in the JSON args only when needed.""",
 
     "write_file": """\
 ```write_file
@@ -3281,6 +3294,13 @@ def _build_actions_snapshot(tool_events: list, limit: int = 8000) -> str:
     return snap[:limit] if len(snap) > limit else snap
 
 
+def _env_timeout(name: str, stock: int) -> int:
+    # Local patch: env-overridable read timeout for one LLM call site.
+    try:
+        return max(5, int(float(os.getenv(name, str(stock)))))
+    except (TypeError, ValueError):
+        return stock
+
 async def _run_verifier_subagent(
     instruction: str, actions_snapshot: str,
     *, endpoint_url: str, model: str, headers: dict,
@@ -3315,7 +3335,7 @@ async def _run_verifier_subagent(
         raw = await llm_call_async(
             url=endpoint_url, model=model,
             messages=[{"role": "user", "content": prompt}],
-            headers=headers, temperature=0.0, max_tokens=600, timeout=60,
+            headers=headers, temperature=0.0, max_tokens=600, timeout=_env_timeout('ODYSSEUS_TIMEOUT_VERIFY', 60),
         )
     except Exception as e:
         logger.warning(f"[agent] verifier subagent failed: {e}")
@@ -4009,6 +4029,9 @@ async def stream_agent_loop(
             from src.tool_index import ALWAYS_AVAILABLE
             _relevant_tools = set(ALWAYS_AVAILABLE)
         _relevant_tools.update({"read_file", "grep", "ls", "manage_documents"})
+        # Local patch: uploads with images can be re-inspected on demand.
+        if any(str(u.get("path", "")).lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")) for u in uploaded_files if isinstance(u, dict)):
+            _relevant_tools.add("vision")
 
     # Per-request forced tools are stronger than retrieval. Explicit search
     # settings make web tools visible even when tool RAG misses them;
@@ -4239,6 +4262,12 @@ async def stream_agent_loop(
                 budget_is_explicit,
                 hard_max=hard_max,
             )
+            # Local patch: estimate_tokens undercounts dense content by a
+            # measured ratio (learned from overflow 400s), so express the
+            # budget in estimate tokens honestly.
+            _est_ratio = get_real_context_ratio(candidate_url, candidate_model)
+            if _est_ratio > 1.05:
+                effective_budget = max(1000, int(effective_budget / _est_ratio))
             trimmed_messages = trim_for_context(
                 route_messages,
                 effective_budget,
@@ -4439,6 +4468,14 @@ async def stream_agent_loop(
     # that *can't* call the tool from looping forever.
     _intent_nudge_count = 0
     _MAX_INTENT_NUDGES = 2
+    # -- Local patch (section 20): thinking-stall guard state --
+    # A thinking model can spend ~80 minutes reasoning with ZERO
+    # visible output before the stock round deadline ends the run
+    # with nothing. Cap that (wall-clock, per round): when it fires
+    # the round is cut short and retried with a corrective nudge.
+    # 0 disables the guard.
+    _thinking_stall_s = max(0.0, float(os.getenv("ODYSSEUS_AGENT_THINKING_STALL_S", "600")))
+    _stall_retrim_count = 0  # local patch: max 2 stall retrims per run
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -4762,7 +4799,9 @@ async def stream_agent_loop(
         _approved_result_injected = True
 
     for round_num in range(1, max_rounds + 1):
+        _kv_guard_count = 0  # local patch: KV-exhaustion retrims this run (max 3)
         round_response = ""
+        _ctx_overflow = None  # local patch: (n_ctx, n_prompt_tokens) from an overflow 400
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling
 
@@ -4875,10 +4914,13 @@ async def stream_agent_loop(
         # which kills a wedged/silent endpoint. This wall-clock deadline is the
         # complementary cap for the rare stream that trickles bytes forever and
         # so never trips the inactivity timeout. Generous — only catches runaway.
-        _round_deadline = time.time() + max(agent_stream_timeout * 4, 1200)
+        _round_deadline = time.time() + max(agent_stream_timeout * 4, int(os.getenv('ODYSSEUS_AGENT_ROUND_DEADLINE', '3600') or '3600'))
         _round_start = time.time()
         _round_first_event_logged = False
         _round_first_token_logged = False
+        # -- Local patch (section 20): per-round thinking-stall clock --
+        _stall_last_visible = time.time()
+        _stall_flagged = False  # set by the in-stream detector when the cap fires
         _round_actual_model = model
         _round_actual_endpoint_id = actual_endpoint_id
         _round_actual_endpoint_label = actual_endpoint_label
@@ -4954,15 +4996,38 @@ async def stream_agent_loop(
                     "[agent-timing] first_event round=%s elapsed=%.3fs kind=%s",
                     round_num,
                     time.time() - _round_start,
-                    "error" if chunk.startswith("event: error") else "data",
+                    "error" if chunk.startswith("event: error") else ("keepalive" if "stream_keepalive" in chunk else "data"),
                 )
             if time.time() > _round_deadline:
                 logger.warning(
                     "[agent-timing] round_deadline round=%s elapsed=%.3fs deadline_s=%s",
                     round_num,
                     time.time() - _round_start,
-                    max(agent_stream_timeout * 4, 1200),
+                    max(agent_stream_timeout * 4, int(os.getenv('ODYSSEUS_AGENT_ROUND_DEADLINE', '3600') or '3600')),
                 )
+                break
+            # -- Local patch (section 20): thinking-stall detector --
+            # The round has been emitting ONLY thinking for longer
+            # than ODYSSEUS_AGENT_THINKING_STALL_S with no visible
+            # text and no tool calls. Cut the stream short; the
+            # post-stream guard below retries the round with a
+            # corrective nudge instead of waiting out the 80-minute
+            # stock deadline and ending the run with nothing.
+            if (_thinking_stall_s > 0
+                    and not _force_answer
+                    and not native_tool_calls
+                    and not round_response
+                    and round_reasoning
+                    and time.time() - _stall_last_visible > _thinking_stall_s):
+                logger.warning(
+                    "[agent] thinking-stall detector round=%s: >%ds of thinking "
+                    "with no visible output (cap %ds); cutting the round short "
+                    "for a nudge retry",
+                    round_num,
+                    int(time.time() - _stall_last_visible),
+                    int(_thinking_stall_s),
+                )
+                _stall_flagged = True
                 break
             # Forward error events from stream_llm to the frontend
             if chunk.startswith("event: error"):
@@ -5194,6 +5259,9 @@ async def stream_agent_loop(
                         if data.get("thinking"):
                             round_reasoning += data["delta"]
                         else:
+                            # Local patch (section 20): visible progress
+                            # resets the thinking-stall clock.
+                            _stall_last_visible = time.time()
                             _delta_text = (
                                 _strip_doc_model_artifacts(data["delta"])
                                 if _ody_qwen_finetune_model
@@ -5206,6 +5274,11 @@ async def stream_agent_loop(
                             data["delta"] = _delta_text
                         if not _ody_qwen_finetune_model or data.get("thinking"):
                             yield f"data: {json.dumps(data)}\n\n"
+                    elif data.get("type") == "stream_keepalive":
+                        # Local patch: prefill heartbeat from the stream
+                        # wrapper -- forward to the client so its watchdog
+                        # stays quiet while a large context pre-fills.
+                        yield chunk
                     elif data.get("error"):
                         err_msg = data.get("error", "unknown")
                         logger.error(f"Agent round {round_num}: stream error: {err_msg}")
@@ -5214,6 +5287,18 @@ async def stream_agent_loop(
                     if round_num == 1:
                         yield chunk
             elif chunk.startswith("event: "):
+                # Local patch: an exceed_context_size 400 carries the
+                # backend's REAL context window (n_ctx) -- learn it and
+                # retry the round with a safe budget instead of ending.
+                if "exceeds the available context" in chunk or "exceed_context_size" in chunk:
+                    _mctx = re.search(r'\\?"n_ctx\\?"\s*:\s*(\d+)', chunk)
+                    _mpt = re.search(r'\\?"n_prompt_tokens\\?"\s*:\s*(\d+)', chunk)
+                    if _mctx:
+                        _ctx_overflow = (int(_mctx.group(1)), int(_mpt.group(1)) if _mpt else 0)
+                        logger.warning(
+                            f"[agent] round {round_num}: backend real context limit "
+                            f"{_ctx_overflow[0]} tokens (catalog claimed more) -- will trim and retry"
+                        )
                 # Forward error events to frontend as visible text
                 yield chunk
             # Intercept [DONE] — don't forward until all rounds finish
@@ -5228,6 +5313,30 @@ async def stream_agent_loop(
             _round_first_token_logged,
         )
         _finalize_round_usage()
+
+        # -- Local patch (section 19): learn the estimate->real
+        # token ratio from the backend's per-round usage. estimate_tokens
+        # undercounts dense code/table content; real usage is ground
+        # truth. The 400-based learning (section 17) never fires when
+        # the stream stops cleanly at KV exhaustion, which is exactly
+        # when an honest ratio is needed for the guard below.
+        if _round_has_real_usage and _round_real_input_tokens > 1000:
+            _lr_req = _last_route_request_messages or messages
+            _lr_est = estimate_tokens(_lr_req)
+            if _lr_est > 0:
+                _lr_ratio = _round_real_input_tokens / _lr_est
+                if 1.02 <= _lr_ratio <= 5.0:
+                    _lr_cur = get_real_context_ratio(endpoint_url, model)
+                    if _lr_ratio > _lr_cur * 1.02:
+                        learn_real_context(
+                            endpoint_url, model, 0,
+                            _round_real_input_tokens, _lr_est,
+                        )
+                        logger.info(
+                            "[agent] learned estimate->real token ratio "
+                            f"{_lr_ratio:.2f} (est {_lr_est} vs real "
+                            f"{_round_real_input_tokens})"
+                        )
         _normalized_doc_round = (
             _normalize_stream_document_fences(
                 round_response,
@@ -5350,7 +5459,7 @@ async def stream_agent_loop(
                     }]
                     _raw = await llm_call_async(
                         url=endpoint_url, model=model, messages=_synth_messages,
-                        headers=headers, temperature=0.3, max_tokens=max_tokens, timeout=60,
+                        headers=headers, temperature=0.3, max_tokens=max_tokens, timeout=_env_timeout('ODYSSEUS_TIMEOUT_SYNTH', 60),
                     )
                     _raw_text = _raw or ""
                     _synth = _strip_think_blocks(strip_tool_blocks(_raw_text)).strip()
@@ -5418,9 +5527,136 @@ async def stream_agent_loop(
         round_models.append(_round_actual_model)
         round_endpoint_ids.append(_round_actual_endpoint_id)
         round_endpoint_labels.append(_round_actual_endpoint_label)
+
+        # -- Local patch: context-overflow recovery --
+        # The backend rejected this round's prompt as larger than its real
+        # context. n_ctx in the error is ground truth even when /v1/models
+        # claims a bigger window, so learn it (and the estimate->real
+        # token ratio), trim the live history to a safe budget, and retry
+        # the round instead of ending the run.
+        if _ctx_overflow:
+            _ov_ctx, _ov_prompt = _ctx_overflow
+            _ov_req = _last_route_request_messages or messages
+            _ov_est = estimate_tokens(_ov_req)
+            learn_real_context(endpoint_url, model, _ov_ctx, _ov_prompt, _ov_est)
+            from src.context_compactor import trim_for_context as _trim_ctx
+            _ov_ratio = get_real_context_ratio(endpoint_url, model)
+            _ov_target = max(8000, int(_ov_ctx * 0.85 / max(_ov_ratio, 1.0)))
+            _ov_before = estimate_tokens(messages)
+            messages = _trim_ctx(messages, _ov_target, reserve_tokens=1024)
+            _ov_after = estimate_tokens(messages)
+            logger.info(
+                f"[agent] context-overflow recovery round={round_num}: real limit "
+                f"{_ov_ctx} (prompt was {_ov_prompt}), est {_ov_before} -> {_ov_after} "
+                f"(target est {_ov_target}, ratio {_ov_ratio:.2f})"
+            )
+            _active_route_state["messages"] = messages
+            _active_route_state.pop("request_messages", None)
+            _ov_note = (
+                "*[Context overflow: the model rejected this round's prompt "
+                "(%s tokens, real limit %s). Trimmed older context and continuing.]*"
+                % ("{:,}".format(_ov_prompt), "{:,}".format(_ov_ctx))
+            )
+            yield f"data: {json.dumps({'delta': chr(10) + chr(10) + _ov_note})}\n\n"
+            continue
         if _ody_qwen_finetune_model and not tool_blocks and cleaned_round:
             yield f'data: {json.dumps({"delta": cleaned_round})}\n\n'
 
+        # -- Local patch (section 19): KV-exhaustion guard --
+        # llama.cpp stops SILENTLY mid-generation (usually during
+        # thinking) when input + output fills the real context
+        # window; the stream ends cleanly with no 400, so the stock
+        # loop mistakes it for a finished turn and ends the run.
+        # If the backend-reported usage for this round already
+        # fills >=98% of the real window and nothing visible was
+        # produced, trim the live history and continue.
+        if (_round_has_real_usage and not native_tool_calls
+                and _strip_think_blocks(cleaned_round).strip() == ""
+                and _round_real_input_tokens > 0):
+            try:
+                _kv_ctx = (get_real_context(endpoint_url, model)
+                           or get_context_length(endpoint_url, model))
+                _kv_room = int(_kv_ctx * 0.98)
+                if (_round_real_input_tokens + _round_real_output_tokens
+                        >= _kv_room and _kv_guard_count < 3):
+                    _kv_guard_count += 1
+                    from src.context_compactor import trim_for_context as _trim_kv
+                    _kv_ratio = get_real_context_ratio(endpoint_url, model)
+                    _kv_target = max(8000, int(_kv_ctx * 0.85 / max(_kv_ratio, 1.0)))
+                    _kv_before = estimate_tokens(messages)
+                    messages = _trim_kv(messages, _kv_target, reserve_tokens=1024)
+                    _kv_after = estimate_tokens(messages)
+                    _active_route_state["messages"] = messages
+                    _active_route_state.pop("request_messages", None)
+                    logger.warning(
+                        f"[agent] KV-exhaustion guard round={round_num}: usage "
+                        f"{_round_real_input_tokens}+{_round_real_output_tokens} vs "
+                        f"real window {_kv_ctx} (98% = {_kv_room}); trimmed est "
+                        f"{_kv_before} -> {_kv_after} (target {_kv_target}, "
+                        f"ratio {_kv_ratio:.2f}) and continuing"
+                    )
+                    _kv_note = (
+                        "*[Context exhausted mid-generation (input + thinking "
+                        f"filled the model's {_kv_ctx:,} token window). Trimmed "
+                        "older context and continuing.]*"
+                    )
+                    _kv_event = {"delta": chr(10) + chr(10) + _kv_note}
+                    yield "data: " + json.dumps(_kv_event) + "\n\n"
+                    continue
+            except Exception as _kv_err:
+                logger.warning(
+                    "[agent] KV-exhaustion guard skipped on round %s: %s",
+                    round_num, _kv_err,
+                )
+
+        # -- Local patch (section 20): thinking-stall retry --
+        # The round above was cut short after emitting only thinking
+        # past the stall cap. Retry the round with a corrective nudge
+        # instead of letting "no tools -> done" end the run (the stock
+        # behavior for a thinking model that deliberates itself into
+        # silence).
+        if (_stall_flagged and not _force_answer
+                and not native_tool_calls
+                and _strip_think_blocks(cleaned_round).strip() == ""):
+            if _stall_retrim_count < 2:
+                _stall_retrim_count += 1
+                logger.warning(
+                    "[agent] thinking-stall guard round=%s: round cut short after "
+                    ">%ds of thinking with no visible output; retrying with a "
+                    "nudge (retry %d/2)",
+                    round_num,
+                    int(_thinking_stall_s),
+                    _stall_retrim_count,
+                )
+                _stall_note = (
+                    "*[The model was reasoning for a long time without progress, "
+                    "so this step was cut short and is being retried.]*"
+                )
+                _stall_event = {"delta": chr(10) + chr(10) + _stall_note}
+                yield "data: " + json.dumps(_stall_event) + "\n\n"
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "You were reasoning for a very long time without producing "
+                        "any visible output or tool call, and this step was cut short. "
+                        "Do not deliberate in circles. Either make ONE concrete tool "
+                        "call now, or write your visible answer/next step in plain "
+                        "text this turn."
+                    ),
+                })
+                _stall_flagged = False
+                continue
+            logger.warning(
+                "[agent] thinking-stall guard EXHAUSTED on round %s (2 retries); "
+                "ending the run here", round_num,
+            )
+            _stall_note2 = (
+                "*[The model kept reasoning without progress after two retries; "
+                "the run is stopping here.]*"
+            )
+            _stall_event2 = {"delta": chr(10) + chr(10) + _stall_note2}
+            yield "data: " + json.dumps(_stall_event2) + "\n\n"
+            break
         if not tool_blocks:
             # ── Completion verifier (mechanism 3a) ────────────────────
             # The model is finishing. If this was an effectful agentic turn,
@@ -5481,6 +5717,7 @@ async def stream_agent_loop(
             # happen to contain "let me know" are not stalls.
             _looks_like_promise = (
                 not guide_only
+                and not _force_answer  # local patch (section 20): no tools on force-answer rounds
                 and _intent_match is not None
                 and len(_intent_text) < 400
                 and "```" not in _intent_text
@@ -5603,11 +5840,13 @@ async def stream_agent_loop(
             messages.append({
                 "role": "system",
                 "content": (
-                    "You're repeating tool calls without converging. STOP calling "
-                    "tools and end the turn one of two ways: (a) write your best "
-                    "final answer NOW from the information already gathered, or "
-                    "(b) if you're genuinely blocked, say plainly what's blocking "
-                    "you in a sentence or two." + _off_note
+                    "You're repeating tool calls without converging. If you were "
+                    "emitting the same placeholder tool call (e.g. a ```json block "
+                    "with {...}) over and over, that is a mistake: make ONE real "
+                    "tool call with actual arguments, or stop calling tools and end "
+                    "the turn one of two ways: (a) write your best final answer NOW "
+                    "from the information already gathered, or (b) if you're genuinely "
+                    "blocked, say plainly what's blocking you in a sentence or two." + _off_note
                 ),
             })
             full_response += "\n\n"

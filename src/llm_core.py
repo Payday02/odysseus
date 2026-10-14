@@ -172,6 +172,17 @@ def _stream_timeout(read_timeout) -> httpx.Timeout:
     """Per-request timeout for streaming LLM calls (connect from config)."""
     return httpx.Timeout(connect=LLMConfig.CONNECT_TIMEOUT, read=float(read_timeout), write=30.0, pool=5.0)
 
+def _prefill_keepalive_interval() -> float:
+    """Local patch: seconds of stream silence before a stream_keepalive event.
+    A large-context prefill emits zero bytes for minutes; a silent SSE
+    connection looks dead to the client (the browser's 6-minute watchdog
+    aborts it). 0 disables keepalives. Tune via ODYSSEUS_PREFILL_KEEPALIVE_S."""
+    try:
+        return max(0.0, float(os.getenv("ODYSSEUS_PREFILL_KEEPALIVE_S", "30")))
+    except (TypeError, ValueError):
+        return 30.0
+
+
 
 # Cache for LLM responses
 def _cache_header_identity(headers) -> str:
@@ -387,16 +398,19 @@ class _DegenerateStreamGuard:
                 self.last_token = token
                 self.same_run = 1
             self.recent_tokens.append(token)
-        if len(self.recent_tokens) > 96:
-            self.recent_tokens = self.recent_tokens[-96:]
+        if len(self.recent_tokens) > 200:
+            self.recent_tokens = self.recent_tokens[-200:]
 
         reason = None
-        if self.same_run >= 28 and self.total_chars >= 100:
+        same_run_cap = int(os.getenv("ODYSSEUS_REPEAT_SAME_RUN", "150"))
+        if self.same_run >= same_run_cap and self.total_chars >= 100:
             reason = f"repeated '{self.last_token}' {self.same_run} times"
         elif len(self.recent_tokens) >= 72:
             top = max(set(self.recent_tokens), key=self.recent_tokens.count)
             count = self.recent_tokens.count(top)
-            if count >= 60 and count / max(len(self.recent_tokens), 1) >= 0.78:
+            dom_count = int(os.getenv("ODYSSEUS_REPEAT_DOM_COUNT", "150"))
+            dom_ratio = float(os.getenv("ODYSSEUS_REPEAT_DOM_RATIO", "0.92"))
+            if count >= dom_count and count / max(len(self.recent_tokens), 1) >= dom_ratio:
                 reason = f"repeated '{top}' {count}/{len(self.recent_tokens)} recent tokens"
         if not reason and len(self.recent_tokens) >= 80:
             # Phrase loops are common on some local quantized MLX/MoE models:
@@ -405,10 +419,13 @@ class _DegenerateStreamGuard:
             # generation. Require many repeats of the same 4-gram so normal
             # prose/list formatting is not interrupted.
             grams = [tuple(self.recent_tokens[i:i + 4]) for i in range(0, len(self.recent_tokens) - 3)]
+            # table-safe: single-word runs belong to the same-run check, not the phrase check
+            grams = [g for g in grams if len(set(g)) > 1]
             if grams:
                 top_gram = max(set(grams), key=grams.count)
                 gram_count = grams.count(top_gram)
-                if gram_count >= 10:
+                gram_cap = int(os.getenv("ODYSSEUS_REPEAT_GRAM_COUNT", "100"))
+                if gram_count >= gram_cap:
                     reason = f"repeated phrase '{' '.join(top_gram)}' {gram_count} times"
 
         if not reason:
@@ -2563,7 +2580,13 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                      tool_choice_none: bool = False, workload: str = "foreground"):
     target_url = _stream_target_url(url)
     async with _local_model_slot(target_url, model, workload):
-        async for chunk in _stream_llm_inner(
+        # Local patch: prefill keepalive. A feeder task drains the inner
+        # stream into a queue; we race the queue wait against a timer and
+        # emit a stream_keepalive event on silence. The queue wait is the
+        # cancellable point -- cancelling a wait on __anext__ would close
+        # the inner async generator and kill the model request.
+        _ka_interval = _prefill_keepalive_interval()
+        _ka_inner = _stream_llm_inner(
             url,
             model,
             messages,
@@ -2575,8 +2598,39 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             tools=tools,
             session_id=session_id,
             tool_choice_none=tool_choice_none,
-        ):
-            yield chunk
+        )
+        if not _ka_interval:
+            async for chunk in _ka_inner:
+                yield chunk
+            return
+        _ka_q: asyncio.Queue = asyncio.Queue()
+        _ka_sentinel = object()
+
+        async def _ka_feed():
+            try:
+                async for _c in _ka_inner:
+                    await _ka_q.put(_c)
+            except BaseException as _e:
+                await _ka_q.put(_e)
+            finally:
+                await _ka_q.put(_ka_sentinel)
+
+        _ka_feeder = asyncio.create_task(_ka_feed())
+        try:
+            while True:
+                try:
+                    _item = await asyncio.wait_for(_ka_q.get(), timeout=_ka_interval)
+                except asyncio.TimeoutError:
+                    yield 'data: ' + json.dumps({"type": "stream_keepalive"}) + '\n\n'
+                    continue
+                if _item is _ka_sentinel:
+                    break
+                if isinstance(_item, BaseException):
+                    raise _item
+                yield _item
+        finally:
+            if not _ka_feeder.done():
+                _ka_feeder.cancel()
 
 
 async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
@@ -3693,6 +3747,11 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                     emitted = True
 
                 if substantive or emitted:
+                    yield chunk
+                elif event_type == "stream_keepalive":
+                    # Local patch: prefill heartbeat -- forward immediately
+                    # (it is a liveness signal, not metadata to flush at
+                    # first output) but never let it commit a candidate.
                     yield chunk
                 elif not is_done:
                     pending_metadata.append(chunk)

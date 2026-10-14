@@ -1,4 +1,11 @@
-use_default_settings: true
+use_default_settings:
+  engines:
+    keep_only:
+      - github
+      - wikipedia
+      - mojeek
+      - bing
+      - google
 
 server:
   secret_key: "__SEARXNG_SECRET__"
@@ -7,3 +14,11 @@ search:
   formats:
     - html
     - json
+
+engines:
+  - name: bing
+    disabled: false
+  - name: mojeek
+    disabled: false
+  - name: google
+    disabled: false

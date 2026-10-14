@@ -1,6 +1,7 @@
 # src/chat_processor.py
 import logging
 import math
+import os
 import re
 import time
 from collections import Counter
@@ -260,6 +261,13 @@ class ChatProcessor:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [mem for _, mem in scored[:k]]
 
+    def _env_timeout(self, name: str, stock: int) -> int:
+        # Local patch: env-overridable read timeout for one LLM call site.
+        try:
+            return max(5, int(float(os.getenv(name, str(stock)))))
+        except (TypeError, ValueError):
+            return stock
+
     def build_context_preface(
         self,
         message: str,
@@ -302,6 +310,29 @@ class ChatProcessor:
                 "role": "system",
                 "content": preset_system_prompt
             })
+
+        # Local patch: global rules from settings.json (global_rules: list[str],
+        # editable via the UI or by editing data/settings.json; 2s cache, so no
+        # restart needed). Injected into EVERY prompt -- this preface is the
+        # single choke point for both normal chat and agent mode -- as a static
+        # system message, KV-cache friendly (the text only changes when the
+        # rules themselves change).
+        try:
+            from src.settings import load_settings as _load_settings
+            _global_rules = _load_settings().get("global_rules")
+            if isinstance(_global_rules, list):
+                _global_rules = [str(r).strip() for r in _global_rules if str(r).strip()]
+            else:
+                _global_rules = []
+            if _global_rules:
+                preface.append({
+                    "role": "system",
+                    "content": "Global rules (user-defined; apply to every message; take precedence over defaults):\n"
+                               + "\n".join(f"{i + 1}. {r}" for i, r in enumerate(_global_rules)),
+                })
+        except Exception as _e:  # never break a request over a settings hiccup
+            logger.warning("global rules injection failed: %s", _e)
+
         preface.append({
             "role": "system",
             "content": UNTRUSTED_CONTEXT_POLICY,
@@ -417,7 +448,7 @@ class ChatProcessor:
                         headers=t_headers,
                         temperature=0.1,
                         max_tokens=50,
-                        timeout=15,
+                        timeout=self._env_timeout('ODYSSEUS_TIMEOUT_QUERY_GEN', 15),
                     ).strip()
 
                     if generated_query:
