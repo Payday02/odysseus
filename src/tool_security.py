@@ -144,6 +144,7 @@ PLAN_MODE_READONLY_TOOLS = {
     "chat_with_model",
     "ask_teacher",
     "get_editor_screenshot",
+    "vision",  # Local patch: read-only image analysis, like chat_with_model
 }
 
 

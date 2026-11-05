@@ -489,18 +489,21 @@ class _DegenerateStreamGuard:
             self.numeric_run = self.numeric_run + 1 if is_num else 0
             self.recent_tokens.append(token)
             self.periodic_tokens.append(token)
-        if len(self.recent_tokens) > 96:
-            self.recent_tokens = self.recent_tokens[-96:]
+        if len(self.recent_tokens) > 200:
+            self.recent_tokens = self.recent_tokens[-200:]
         if len(self.periodic_tokens) > 2048:
             self.periodic_tokens = self.periodic_tokens[-2048:]
 
         reason = None
-        if self.same_run >= 28 and self.total_chars >= 100 and not _is_numeric_token(self.last_token):
+        same_run_cap = int(os.getenv("ODYSSEUS_REPEAT_SAME_RUN", "150"))
+        if self.same_run >= same_run_cap and self.total_chars >= 100 and not _is_numeric_token(self.last_token):
             reason = f"repeated '{self.last_token}' {self.same_run} times"
         elif len(self.recent_tokens) >= 72:
             top = max(set(self.recent_tokens), key=self.recent_tokens.count)
             count = self.recent_tokens.count(top)
-            if count >= 60 and count / max(len(self.recent_tokens), 1) >= 0.78 and not _is_numeric_token(top):
+            dom_count = int(os.getenv("ODYSSEUS_REPEAT_DOM_COUNT", "150"))
+            dom_ratio = float(os.getenv("ODYSSEUS_REPEAT_DOM_RATIO", "0.92"))
+            if count >= dom_count and count / max(len(self.recent_tokens), 1) >= dom_ratio and not _is_numeric_token(top):
                 reason = f"repeated '{top}' {count}/{len(self.recent_tokens)} recent tokens"
         if (
             not reason
@@ -522,7 +525,8 @@ class _DegenerateStreamGuard:
                     recent[index] == recent[index - period]
                     for index in range(period, len(recent))
                 )
-                if comparisons and equal / comparisons >= 0.92:
+                period_ratio = float(os.getenv("ODYSSEUS_REPEAT_PERIOD_RATIO", "0.92"))
+                if comparisons and equal / comparisons >= period_ratio:
                     phrase = " ".join(recent[-period:])
                     reason = f"repeated phrase '{phrase}' for {cycles} cycles"
                     break

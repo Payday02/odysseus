@@ -61,6 +61,19 @@ ALWAYS_AVAILABLE = frozenset({
     # Write back to the active plan (tick steps done / revise) during execution.
     "update_plan",
 })
+# Local patch: always-on tools from the environment. Comma-separated
+# tool names (e.g. ODYSSEUS_ALWAYS_TOOLS=bash,python) are UNIONED into
+# ALWAYS_AVAILABLE so they are sent to the model every turn instead of
+# only when retrieval happens to pick them. Unknown names are simply
+# ignored (prompt/schema assembly filters to registered tools). The env
+# var is read at import time: change it in .env and `docker compose
+# up -d` (no image rebuild needed for a different selection).
+_ALWAYS_FROM_ENV = os.getenv("ODYSSEUS_ALWAYS_TOOLS", "bash")
+_env_always = frozenset(
+    t.strip() for t in _ALWAYS_FROM_ENV.split(",") if t.strip()
+)
+ALWAYS_AVAILABLE = ALWAYS_AVAILABLE | _env_always
+
 
 # Literal intent hints for scripts where ``\b`` is not a useful token
 # boundary.  Embedding retrieval is multilingual but approximate; a request
@@ -116,6 +129,7 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "inspect_media": "Inspect local workspace images, SVGs, videos, and PDF pages with the current multimodal model. Samples bounded timestamped video frames uniformly, at scene cuts, or from temporally diverse motion peaks; renders SVG to PNG; exports stills or clips; concatenates ranges; changes clip speed while preserving audio pitch; and renders query-relevant PDF pages. Prefer these native operations over raw ffmpeg. Increase max_dimension only for small visual details; saved exports keep source quality.",
     "extract_text": "Extract exact visible text, confidence, and pixel centers from a local workspace image with Odysseus local OCR. Use for screenshots, scans, labels, numbers, receipts, and text-location tasks; use inspect_media for general visual understanding.",
     "transcribe_media": "Transcribe dialogue, narration, names, and spoken timing from a local audio or video file with Odysseus local Whisper. Returns [START --> END] TEXT segments and always persists them to a workspace text file. For a named chapter, question, scene, or topic, locate its boundaries and restrict filtering to that interval. This handles audio speech; combine with inspect_media for audiovisual tasks or visually burned-in subtitles.",
+    "vision": "Analyze an image on disk (screenshot, diagram, photo, chart) with the configured vision model and return its description. Use when the model must SEE or reason about an image's contents -- circuit screenshots, rendered diagrams, plots, attached photos. Optional focus prompt. Distinct from read_file (text) and from the automatic chat-attachment pre-pass, which gives only one generic description.",
     "read_file": "Read a file from disk and return its contents. View source code, config files, logs. Supports an optional line range (offset/limit) for large files.",
     "grep": "Search file CONTENTS for a regex across a directory tree (ripgrep-backed, honours .gitignore). Returns file:line:match. Use to find where code/symbols/strings live — prefer over bash grep.",
     "glob": "Find FILES by glob pattern (e.g. '**/*.py'), newest first. Use to locate files by name/extension — prefer over bash find/ls.",

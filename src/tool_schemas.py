@@ -38,6 +38,7 @@ _REQUIRED_NATIVE_TOOL_ARGS = {
     "extract_text": ("path",),
     "transcribe_media": ("path",),
     "read_file": ("path",),
+    "vision": ("path",),
     "write_file": ("path",),
     "edit_file": ("path",),
     "apply_patch": ("patch_text", "patchText", "patch"),
@@ -518,6 +519,23 @@ FUNCTION_TOOL_SCHEMAS = [
                     "max_results": {"type": "integer", "description": "Maximum comments, uploads, or results to return, capped at 50"}
                 },
                 "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vision",
+            "description": "Analyze an image on disk (screenshot, diagram, photo, chart) with the configured vision model and get its description back. Optional prompt focuses the analysis. Use for images whose contents you need to reason about, e.g. circuit screenshots or charts, or an attachment path listed in the prompt.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path of the image file (png/jpg/jpeg/gif/webp/bmp)"},
+                    "prompt": {"type": "string", "description": "Optional focus, e.g. which component or connection to describe; default is describe in detail"},
+                    "no_thinking": {"type": "boolean", "description": "Default true: skip the model reasoning step for roughly 30 percent faster analysis (Qwen3 /no_think switch). Set false for very complex images where extra reasoning helps."},
+                    "max_tokens": {"type": "integer", "description": "Cap on description length in tokens. Default 5000."},
+                },
+                "required": ["path"]
             }
         }
     },

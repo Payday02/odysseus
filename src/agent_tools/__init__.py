@@ -28,6 +28,7 @@ from .document_tools import CreateDocumentTool, UpdateDocumentTool, EditDocument
 from .interaction_tools import AskUserTool, UpdatePlanTool
 from .model_interaction_tools import ChatWithModelTool, AskTeacherTool, ListModelsTool
 from .bg_job_tools import ManageBgJobsTool
+from .vision_tools import VisionTool
 from .session_tools import CreateSessionTool, ListSessionsTool, SendToSessionTool, ManageSessionTool
 from .editor_tools import PlanEditTool, RunEditorCommandTool, GetEditorScreenshotTool, AiEditImageTool
 from .admin_tools import (
@@ -68,6 +69,7 @@ TOOL_HANDLERS = {
     "chat_with_model": ChatWithModelTool().execute,
     "ask_teacher": AskTeacherTool().execute,
     "list_models": ListModelsTool().execute,
+    "vision": VisionTool().execute,
     "manage_bg_jobs": ManageBgJobsTool().execute,
     "create_session": CreateSessionTool().execute,
     "list_sessions": ListSessionsTool().execute,

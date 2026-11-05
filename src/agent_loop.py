@@ -7151,7 +7151,7 @@ _DOMAIN_TOOL_MAP = {
     "skills": {"manage_skills"},
     "ui": {"ui_control"},
     "sessions": {"create_session", "list_sessions", "manage_session", "send_to_session", "search_chats"},
-    "files": {"bash", "python", "read_file", "write_file", "edit_file", "apply_patch", "todowrite", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs"},
+    "files": {"bash", "python", "read_file", "write_file", "edit_file", "apply_patch", "todowrite", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs", "vision"},  # Local patch: + vision
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
     "contacts": {"resolve_contact", "manage_contact"},
     "integrations": {"api_call"},
@@ -7960,6 +7960,13 @@ Read YouTube-specific data without fighting the JavaScript UI. Actions: `comment
 <file path>
 ```
 Read a text file or extract readable text from a PDF or Office document. Optional JSON arguments `offset` and `limit` select a line range.""",
+
+    "vision": """\
+```vision
+{"path": "<image file path>", "prompt": "<what to look for>"}
+```
+Analyze an image on disk with the configured vision model and return its description. Use for images whose contents you must reason about -- circuit screenshots, diagrams, charts, photos -- including attachment paths listed in the prompt. Optional "prompt" focuses the analysis (default: describe in detail). Optional "no_thinking": true skips model reasoning (~30% faster, Paths are confined to the same roots as read_file. Defaults: no_thinking is true and max_tokens is 5000 -- override either in the JSON args only when needed.
+""",
 
     "write_file": """\
 ```write_file
@@ -16817,6 +16824,13 @@ def _build_actions_snapshot(tool_events: list, limit: int = 8000) -> str:
     return snap[:limit] if len(snap) > limit else snap
 
 
+def _env_timeout(name: str, stock: int) -> int:
+    # Local patch: env-overridable read timeout for one LLM call site.
+    try:
+        return max(5, int(float(os.getenv(name, str(stock)))))
+    except (TypeError, ValueError):
+        return stock
+
 async def _run_verifier_subagent(
     instruction: str, actions_snapshot: str,
     *, endpoint_url: str, model: str, headers: dict,
@@ -16851,7 +16865,7 @@ async def _run_verifier_subagent(
         raw = await llm_call_async(
             url=endpoint_url, model=model,
             messages=[{"role": "user", "content": prompt}],
-            headers=headers, temperature=0.0, max_tokens=600, timeout=60,
+            headers=headers, temperature=0.0, max_tokens=600, timeout=_env_timeout('ODYSSEUS_TIMEOUT_VERIFY', 60),
         )
     except Exception as e:
         logger.warning(f"[agent] verifier subagent failed: {e}")
@@ -22874,6 +22888,9 @@ async def stream_agent_loop(
             from src.tool_index import ALWAYS_AVAILABLE
             _relevant_tools = set(ALWAYS_AVAILABLE)
         _relevant_tools.update({"read_file", "grep", "ls", "manage_documents"})
+        # Local patch: uploads with images can be re-inspected on demand.
+        if any(str(u.get("path", "")).lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")) for u in uploaded_files if isinstance(u, dict)):
+            _relevant_tools.add("vision")
         if _uploaded_read_only_turn:
             _relevant_tools = {"read_file"}
             logger.info(
@@ -26642,7 +26659,7 @@ async def stream_agent_loop(
         # which kills a wedged/silent endpoint. This wall-clock deadline is the
         # complementary cap for the rare stream that trickles bytes forever and
         # so never trips the inactivity timeout. Generous — only catches runaway.
-        _round_deadline = time.time() + max(agent_stream_timeout * 4, 1200)
+        _round_deadline = time.time() + max(agent_stream_timeout * 4, int(os.getenv('ODYSSEUS_AGENT_ROUND_DEADLINE', '3600') or '3600'))
         _round_start = time.time()
         _round_first_event_logged = False
         _round_first_token_logged = False
@@ -27276,14 +27293,14 @@ async def stream_agent_loop(
                     "[agent-timing] first_event round=%s elapsed=%.3fs kind=%s",
                     round_num,
                     time.time() - _round_start,
-                    "error" if chunk.startswith("event: error") else "data",
+                    "error" if chunk.startswith("event: error") else ("keepalive" if "stream_keepalive" in chunk else "data"),
                 )
             if time.time() > _round_deadline:
                 logger.warning(
                     "[agent-timing] round_deadline round=%s elapsed=%.3fs deadline_s=%s",
                     round_num,
                     time.time() - _round_start,
-                    max(agent_stream_timeout * 4, 1200),
+                    max(agent_stream_timeout * 4, int(os.getenv('ODYSSEUS_AGENT_ROUND_DEADLINE', '3600') or '3600')),
                 )
                 break
             # Forward error events from stream_llm to the frontend
@@ -27899,6 +27916,11 @@ async def stream_agent_loop(
                                         _live_data["delta"] = _live_delta
                                         _live_data["round"] = round_num
                                         yield f"data: {json.dumps(_live_data)}\n\n"
+                    elif data.get("type") == "stream_keepalive":
+                        # Local patch: prefill heartbeat from the stream
+                        # wrapper -- forward to the client so its watchdog
+                        # stays quiet while a large context pre-fills.
+                        yield chunk
                     elif data.get("error"):
                         err_msg = data.get("error", "unknown")
                         logger.error(f"Agent round {round_num}: stream error: {err_msg}")

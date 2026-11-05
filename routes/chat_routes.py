@@ -4402,6 +4402,11 @@ def setup_chat_routes(
                                     last_metrics.setdefault("response_time", round(time.time() - _chat_start, 2))
                                     _annotate_chat_cost(last_metrics, sess)
                                     yield f'data: {json.dumps({"type": "metrics", "data": last_metrics})}\n\n'
+                                else:
+                                    # Local patch: forward unrecognized data events
+                                    # (stream_keepalive) so the browser watchdog
+                                    # stays quiet during long prefills.
+                                    yield chunk
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: error"):
@@ -4951,6 +4956,13 @@ def setup_chat_routes(
                                             ),
                                         )
                                     yield f'data: {json.dumps(_metrics_event)}\n\n'
+                                else:
+                                    # Local patch: forward unrecognized data events
+                                    # (agent_prep, stream_keepalive). Stock dropped
+                                    # them here, so the browser never saw early
+                                    # progress and its 6-minute watchdog fired
+                                    # during long prefills.
+                                    yield chunk
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: "):
