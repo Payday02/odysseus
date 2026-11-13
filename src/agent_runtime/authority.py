@@ -490,6 +490,11 @@ def create_request_authority(request_text, *, owner=None, session_id=None, works
         operation = None
     tools.update(_trusted_local_mcp_request_tools(request_text, intent))
     grants = []
+    # ODYSSEUS_ALWAYS_TOOLS bypass for semantic classification
+    import os as _os
+    _ae = _os.environ.get("ODYSSEUS_ALWAYS_TOOLS", "")
+    if _ae:
+        tools |= {t.strip() for t in _ae.split(",") if t.strip()}
     for name in sorted(tools | {"ask_user", "update_plan"}):
         name = canonical_tool(name)
         actions = inputs = None

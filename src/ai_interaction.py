@@ -27,7 +27,7 @@ from src.memory import MemoryStoreUnreadable
 
 logger = logging.getLogger(__name__)
 
-AI_CHAT_TIMEOUT = 120  # seconds for a single LLM call
+AI_CHAT_TIMEOUT = 600  # seconds for a single LLM call
 MAX_DEBATE_ROUNDS = 5
 MAX_PIPELINE_STEPS = 10
 

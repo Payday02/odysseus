@@ -179,7 +179,7 @@ async def _local_model_slot(target_url: str, model: str, workload: Optional[str]
 
 class LLMConfig:
     """Configuration constants for LLM operations."""
-    DEFAULT_TIMEOUT = 30
+    DEFAULT_TIMEOUT = 600
     DEFAULT_TEMPERATURE = 1.0
     DEFAULT_MAX_TOKENS = 32768
     MAX_RETRIES = 3
@@ -1775,7 +1775,7 @@ if _DEEPSEEK_REASONING_EFFORT not in {"high", "max"}:
 
 # Models that support structured thinking — may output </think> without opening tag
 _THINKING_MODEL_PATTERNS = (
-    "qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "deepseek-v4",
+    "qwen3", "qwen-swift", "qwen", "qwq", "deepseek-r1", "deepseek-reasoner", "deepseek-v4",
     "minimax", "m2-reap", "gemma", "stepfun", "step-3", "step3",
     "magistral", "mistral-small", "mistral-medium",
 )

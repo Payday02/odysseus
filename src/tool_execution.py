@@ -499,7 +499,7 @@ async def _route_tool_via_bridge(tool: str, content: str, session_id: Optional[s
         if glob is not None:
             payload["glob"] = glob
         return f"grep: {pattern[:80]}", await _bridge_post(
-            bridge, "/grep", payload, timeout_s=60.0, err_prefix="grep",
+            bridge, "/grep", payload, timeout_s=180.0, err_prefix="grep",
         )
     if tool in {"ls", "list_dir"}:
         stripped = content.strip()

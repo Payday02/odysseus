@@ -469,8 +469,20 @@ export function hasUnclosedThinkTag(text) {
   return openCount > closeCount;
 }
 
+// Explicit chain-of-thought markers: always reasoning, no length gate.
+const _EXPLICIT_REASONING_PREFIX_RE = /^\s*thinking(?:\s+process)?\s*:/i;
+// Conversational openers that double as normal agent narration (e.g. "Let me
+// check the logs" between tool calls). Treat these as untagged reasoning only
+// when the text is long enough to be a real reasoning block — a single short
+// narration sentence is never chain-of-thought.
+const _CONVERSATIONAL_REASONING_PREFIX_RE =
+  /^\s*(?:the user |user wants|we need |i need |i should |i will |i'll |i am going |let me (?:think|look|see|check|read|review|analyze|parse|figure|draft|write)|they are |the question |i can )/i;
+const _REASONING_MIN_CHARS = 150;
+
 export function startsWithReasoningPrefix(text) {
-  return /^\s*(?:thinking(?:\s+process)?\s*:|the user |user wants|we need |i need |i should |i will |i'll |i am going |let me (?:think|look|see|check|read|review|analyze|parse|figure|draft|write)|they are |the question |i can )/i.test(text || '');
+  const t = String(text || '');
+  if (_EXPLICIT_REASONING_PREFIX_RE.test(t)) return true;
+  return _CONVERSATIONAL_REASONING_PREFIX_RE.test(t) && t.trim().length > _REASONING_MIN_CHARS;
 }
 
 export function normalizeThinkingMarkup(text) {
@@ -541,7 +553,8 @@ function normalizePlainThinking(text) {
     }
   }
 
-  if (/^\s*(?:thinking(?:\s+process)?\s*:|the user |user wants|we need |let me (?:think|look|see|check|read|review|analyze|parse|figure|draft|write)|i need to |i should |i will |i'll |i am going )/i.test(trimmed)) {
+  if (_EXPLICIT_REASONING_PREFIX_RE.test(trimmed) ||
+      (_CONVERSATIONAL_REASONING_PREFIX_RE.test(trimmed) && trimmed.length > _REASONING_MIN_CHARS)) {
     const thinkBlock = withoutPrefix.trim();
     if (thinkBlock) return `<think>${thinkBlock}</think>`;
   }

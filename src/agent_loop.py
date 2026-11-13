@@ -38,7 +38,14 @@ from src.llm_core import (
     _normalize_http_status,
     _normalize_usage_counts,
 )
-from src.model_context import estimate_tokens, is_local_endpoint
+from src.model_context import (
+    estimate_tokens,
+    get_context_length,
+    get_real_context,
+    get_real_context_ratio,
+    is_local_endpoint,
+    learn_real_context,
+)
 from src.model_profiles import (
     ODYSSEUS_COMPACT_TOOL_SCHEMA_PROFILE,
     is_odysseus_merged_tools_model,
@@ -25191,6 +25198,15 @@ async def stream_agent_loop(
     # that *can't* call the tool from looping forever.
     _intent_nudge_count = 0
     _MAX_INTENT_NUDGES = 2
+    # -- Local patch (section 20): thinking-stall guard state --
+    # A thinking model can spend ~80 minutes reasoning with ZERO
+    # visible output before the stock round deadline ends the run
+    # with nothing. Cap that (wall-clock, per round): when it fires
+    # the round is cut short and retried with a corrective nudge.
+    # 0 disables the guard.
+    _thinking_stall_s = max(0.0, float(os.getenv("ODYSSEUS_AGENT_THINKING_STALL_S", "600")))
+    _stall_retrim_count = 0  # local patch: max 2 stall retrims per run
+    _kv_guard_count = 0  # local patch: KV-exhaustion retrims this run (max 3)
     _clarification_nudge_count = 0
     _MAX_CLARIFICATION_NUDGES = 1
     _unattended_final_nudge_sent = False
@@ -26663,6 +26679,9 @@ async def stream_agent_loop(
         _round_start = time.time()
         _round_first_event_logged = False
         _round_first_token_logged = False
+        # -- Local patch (section 20): per-round thinking-stall clock --
+        _stall_last_visible = time.time()
+        _stall_flagged = False  # set by the in-stream detector when the cap fires
         _round_actual_model = model
         _round_actual_endpoint_id = actual_endpoint_id
         _round_actual_endpoint_label = actual_endpoint_label
@@ -27303,6 +27322,29 @@ async def stream_agent_loop(
                     max(agent_stream_timeout * 4, int(os.getenv('ODYSSEUS_AGENT_ROUND_DEADLINE', '3600') or '3600')),
                 )
                 break
+            # -- Local patch (section 20): thinking-stall detector --
+            # The round has been emitting ONLY thinking for longer
+            # than ODYSSEUS_AGENT_THINKING_STALL_S with no visible
+            # text and no tool calls. Cut the stream short; the
+            # post-stream guard below retries the round with a
+            # corrective nudge instead of waiting out the 80-minute
+            # stock deadline and ending the run with nothing.
+            if (_thinking_stall_s > 0
+                    and not _force_answer
+                    and not native_tool_calls
+                    and not round_response
+                    and round_reasoning
+                    and time.time() - _stall_last_visible > _thinking_stall_s):
+                logger.warning(
+                    "[agent] thinking-stall detector round=%s: >%ds of thinking "
+                    "with no visible output (cap %ds); cutting the round short "
+                    "for a nudge retry",
+                    round_num,
+                    int(time.time() - _stall_last_visible),
+                    int(_thinking_stall_s),
+                )
+                _stall_flagged = True
+                break
             # Forward error events from stream_llm to the frontend
             if chunk.startswith("event: error"):
                 logger.warning(
@@ -27834,6 +27876,11 @@ async def stream_agent_loop(
                         # next request (DeepSeek requires this; harmless for
                         # other vendors). Regular content still flows into
                         # round_response unchanged.
+                        # Local patch (section 31): thinking is off, so reasoning_content
+                        # deltas are really narration/answer text -- clear the thinking
+                        # flag so they are accumulated and yielded as normal content.
+                        if data.get("thinking") and thinking_mode == "off":
+                            data.pop("thinking", None)
                         if data.get("thinking"):
                             # Even when Qwen's private reasoning is hidden from
                             # the client, retain it for the assistant tool-call
@@ -27845,6 +27892,9 @@ async def stream_agent_loop(
                             if _qwen38_tool_router:
                                 continue
                         else:
+                            # Local patch (section 20): visible progress
+                            # resets the thinking-stall clock.
+                            _stall_last_visible = time.time()
                             _qwen_text_cleanup = (
                                 _ody_qwen_finetune_model or _qwen38_tool_router
                             )
@@ -27943,6 +27993,30 @@ async def stream_agent_loop(
             _round_first_token_logged,
         )
         _finalize_round_usage()
+
+        # -- Local patch (section 19): learn the estimate->real
+        # token ratio from the backend's per-round usage. estimate_tokens
+        # undercounts dense code/table content; real usage is ground
+        # truth. The 400-based learning (section 17) never fires when
+        # the stream stops cleanly at KV exhaustion, which is exactly
+        # when an honest ratio is needed for the guard below.
+        if _round_has_real_usage and _round_real_input_tokens > 1000:
+            _lr_req = _last_route_request_messages or messages
+            _lr_est = estimate_tokens(_lr_req)
+            if _lr_est > 0:
+                _lr_ratio = _round_real_input_tokens / _lr_est
+                if 1.02 <= _lr_ratio <= 5.0:
+                    _lr_cur = get_real_context_ratio(endpoint_url, model)
+                    if _lr_ratio > _lr_cur * 1.02:
+                        learn_real_context(
+                            endpoint_url, model, 0,
+                            _round_real_input_tokens, _lr_est,
+                        )
+                        logger.info(
+                            "[agent] learned estimate->real token ratio "
+                            f"{_lr_ratio:.2f} (est {_lr_est} vs real "
+                            f"{_round_real_input_tokens})"
+                        )
         _normalized_doc_round = (
             _normalize_stream_document_fences(
                 round_response,
@@ -30603,6 +30677,101 @@ async def stream_agent_loop(
             yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
             continue
 
+        # -- Local patch (section 19): KV-exhaustion guard --
+        # llama.cpp stops SILENTLY mid-generation (usually during
+        # thinking) when input + output fills the real context
+        # window; the stream ends cleanly with no 400, so the stock
+        # loop mistakes it for a finished turn and ends the run.
+        # If the backend-reported usage for this round already
+        # fills >=98% of the real window and nothing visible was
+        # produced, trim the live history and continue.
+        if (_round_has_real_usage and not native_tool_calls and not tool_blocks
+                and _strip_think_blocks(cleaned_round).strip() == ""
+                and _round_real_input_tokens > 0):
+            try:
+                _kv_ctx = (get_real_context(endpoint_url, model)
+                           or get_context_length(endpoint_url, model))
+                _kv_room = int(_kv_ctx * 0.98)
+                if (_round_real_input_tokens + _round_real_output_tokens
+                        >= _kv_room and _kv_guard_count < 3):
+                    _kv_guard_count += 1
+                    from src.context_compactor import trim_for_context as _trim_kv
+                    _kv_ratio = get_real_context_ratio(endpoint_url, model)
+                    _kv_target = max(8000, int(_kv_ctx * 0.85 / max(_kv_ratio, 1.0)))
+                    _kv_before = estimate_tokens(messages)
+                    messages = _trim_kv(messages, _kv_target, reserve_tokens=1024)
+                    _kv_after = estimate_tokens(messages)
+                    _active_route_state["messages"] = messages
+                    _active_route_state.pop("request_messages", None)
+                    logger.warning(
+                        f"[agent] KV-exhaustion guard round={round_num}: usage "
+                        f"{_round_real_input_tokens}+{_round_real_output_tokens} vs "
+                        f"real window {_kv_ctx} (98% = {_kv_room}); trimmed est "
+                        f"{_kv_before} -> {_kv_after} (target {_kv_target}, "
+                        f"ratio {_kv_ratio:.2f}) and continuing"
+                    )
+                    _kv_note = (
+                        "*[Context exhausted mid-generation (input + thinking "
+                        f"filled the model's {_kv_ctx:,} token window). Trimmed "
+                        "older context and continuing.]*"
+                    )
+                    _kv_event = {"delta": chr(10) + chr(10) + _kv_note}
+                    yield "data: " + json.dumps(_kv_event) + "\n\n"
+                    continue
+            except Exception as _kv_err:
+                logger.warning(
+                    "[agent] KV-exhaustion guard skipped on round %s: %s",
+                    round_num, _kv_err,
+                )
+
+        # -- Local patch (section 20): thinking-stall retry --
+        # The round above was cut short after emitting only thinking
+        # past the stall cap. Retry the round with a corrective nudge
+        # instead of letting "no tools -> done" end the run (the stock
+        # behavior for a thinking model that deliberates itself into
+        # silence).
+        if (_stall_flagged and not _force_answer
+                and not native_tool_calls
+                and _strip_think_blocks(cleaned_round).strip() == ""):
+            if _stall_retrim_count < 2:
+                _stall_retrim_count += 1
+                logger.warning(
+                    "[agent] thinking-stall guard round=%s: round cut short after "
+                    ">%ds of thinking with no visible output; retrying with a "
+                    "nudge (retry %d/2)",
+                    round_num,
+                    int(_thinking_stall_s),
+                    _stall_retrim_count,
+                )
+                _stall_note = (
+                    "*[The model was reasoning for a long time without progress, "
+                    "so this step was cut short and is being retried.]*"
+                )
+                _stall_event = {"delta": chr(10) + chr(10) + _stall_note}
+                yield "data: " + json.dumps(_stall_event) + "\n\n"
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "You were reasoning for a very long time without producing "
+                        "any visible output or tool call, and this step was cut short. "
+                        "Do not deliberate in circles. Either make ONE concrete tool "
+                        "call now, or write your visible answer/next step in plain "
+                        "text this turn."
+                    ),
+                })
+                _stall_flagged = False
+                continue
+            logger.warning(
+                "[agent] thinking-stall guard EXHAUSTED on round %s (2 retries); "
+                "ending the run here", round_num,
+            )
+            _stall_note2 = (
+                "*[The model kept reasoning without progress after two retries; "
+                "the run is stopping here.]*"
+            )
+            _stall_event2 = {"delta": chr(10) + chr(10) + _stall_note2}
+            yield "data: " + json.dumps(_stall_event2) + "\n\n"
+            break
         if not tool_blocks:
             # A terminal model can keep emitting long prose after artifact
             # recovery has explicitly narrowed the surface to a required
@@ -31373,6 +31542,7 @@ async def stream_agent_loop(
             # with earlier planning language alone.
             _looks_like_promise = (
                 not guide_only
+                and not _force_answer  # local patch (section 20): no tools on force-answer rounds
                 and (
                     not _artifact_outputs_complete
                     or _artifact_finish_nudge_sent
@@ -31981,11 +32151,13 @@ async def stream_agent_loop(
             messages.append({
                 "role": "system",
                 "content": (
-                    "You're repeating tool calls without converging. STOP calling "
-                    "tools and end the turn one of two ways: (a) write your best "
-                    "final answer NOW from the information already gathered, or "
-                    "(b) if you're genuinely blocked, say plainly what's blocking "
-                    "you in a sentence or two." + _off_note
+                    "You're repeating tool calls without converging. If you were "
+                    "emitting the same placeholder tool call (e.g. a ```json block "
+                    "with {...}) over and over, that is a mistake: make ONE real "
+                    "tool call with actual arguments, or stop calling tools and end "
+                    "the turn one of two ways: (a) write your best final answer NOW "
+                    "from the information already gathered, or (b) if you're genuinely "
+                    "blocked, say plainly what's blocking you in a sentence or two." + _off_note
                 ),
             })
             full_response += "\n\n"

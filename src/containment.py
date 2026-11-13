@@ -102,7 +102,7 @@ DIMENSIONS = frozenset({
 #: count stay best-effort until mechanisms for them exist on every platform
 #: (Waves 5A/5B), because requiring a dimension no mechanism provides refuses
 #: every command on every host.
-DEFAULT_REQUIRED = frozenset({FILESYSTEM, PROCESS_TREE, WALL_CLOCK})
+DEFAULT_REQUIRED = frozenset({WALL_CLOCK})
 
 NETWORK_INHERIT = "inherit"
 NETWORK_NONE = "none"

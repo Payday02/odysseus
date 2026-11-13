@@ -3475,9 +3475,12 @@ def setup_chat_routes(
                 )
             )
             if not _web_workspace_output:
-                disabled_tools.update({
+                # Local patch: ODYSSEUS_ALWAYS_TOOLS overrides this -- tools the
+                # user pinned always-on are kept even on web-intent turns.
+                from src.tool_index import ALWAYS_AVAILABLE as _always_tools
+                disabled_tools |= ({
                     "bash", "python", "read_file", "write_file", "edit_file",
-                })
+                } - _always_tools)
             if _search_enabled:
                 disabled_tools.difference_update(WEB_TOOL_NAMES)
             else:
