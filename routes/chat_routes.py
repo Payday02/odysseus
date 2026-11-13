@@ -1456,7 +1456,12 @@ def setup_chat_routes(
             # A direct lookup/search request should not drift into personal
             # tools or shell fallbacks. It can only use web_search/web_fetch
             # when the request's explicit web setting enabled them.
-            disabled_tools.update({
+            # Local patch: ODYSSEUS_ALWAYS_TOOLS overrides this -- tools the
+            # user pinned always-on are kept even on web-intent turns (the
+            # classifier mislabels non-web prompts as web more often than
+            # not; stripping bash/python there broke normal work).
+            from src.tool_index import ALWAYS_AVAILABLE as _always_tools
+            _web_intent_disabled = {
                 "bash", "python",
                 "search_chats", "manage_skills", "manage_memory",
                 "read_file", "write_file", "edit_file",
@@ -1464,7 +1469,8 @@ def setup_chat_routes(
                 "send_email", "reply_to_email",
                 "manage_notes", "manage_calendar", "manage_tasks",
                 "api_call",
-            })
+            }
+            disabled_tools |= (_web_intent_disabled - _always_tools)
             if _search_enabled:
                 disabled_tools.difference_update(WEB_TOOL_NAMES)
             else:
@@ -2058,6 +2064,11 @@ def setup_chat_routes(
                                     # Wall-clock response time for the stats popup ("Time").
                                     last_metrics.setdefault("response_time", round(time.time() - _chat_start, 2))
                                     yield f'data: {json.dumps({"type": "metrics", "data": last_metrics})}\n\n'
+                                else:
+                                    # Local patch: forward unrecognized data events
+                                    # (stream_keepalive) so the browser watchdog
+                                    # stays quiet during long prefills.
+                                    yield chunk
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: error"):
@@ -2464,6 +2475,13 @@ def setup_chat_routes(
                                     if data.get("teacher") is True:
                                         _metrics_event["teacher"] = True
                                     yield f'data: {json.dumps(_metrics_event)}\n\n'
+                                else:
+                                    # Local patch: forward unrecognized data events
+                                    # (agent_prep, stream_keepalive). Stock dropped
+                                    # them here, so the browser never saw early
+                                    # progress and its 6-minute watchdog fired
+                                    # during long prefills.
+                                    yield chunk
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: "):

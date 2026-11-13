@@ -238,6 +238,49 @@ KNOWN_CONTEXT_WINDOWS = {
 _context_cache: Dict[Tuple[str, str], Tuple[int, bool]] = {}
 
 
+# Local patch: the backend's ACTUALLY-enforced context window, learned
+# from exceed_context_size errors (their n_ctx field). A router's
+# /v1/models catalog can claim a window (e.g. 1M) the serving instance
+# does not really run with (e.g. a 262k slot), so the error is ground
+# truth. _real_ctx_ratios stores the measured estimate->real token ratio
+# (estimate_tokens undercounts dense code/table content by ~40-70%), so
+# budgets and compaction thresholds can be expressed honestly.
+_real_ctx_overrides: Dict[Tuple[str, str], int] = {}
+_real_ctx_ratios: Dict[Tuple[str, str], float] = {}
+
+
+def learn_real_context(endpoint_url: str, model: str, n_ctx: int,
+                       n_prompt_tokens: int = 0, est_tokens: int = 0) -> int:
+    """Record the context window the backend actually enforces (from an
+    exceed_context_size error) and, when both the real prompt size and
+    our estimate are known, the measured estimate->real token ratio."""
+    key = (endpoint_url, model)
+    try:
+        n_ctx = int(n_ctx or 0)
+    except (TypeError, ValueError):
+        n_ctx = 0
+    if n_ctx > 0:
+        _real_ctx_overrides[key] = n_ctx
+    try:
+        n_prompt_tokens = int(n_prompt_tokens or 0)
+        est_tokens = int(est_tokens or 0)
+    except (TypeError, ValueError):
+        n_prompt_tokens = est_tokens = 0
+    if n_prompt_tokens > 0 and est_tokens > 0:
+        ratio = n_prompt_tokens / est_tokens
+        if 1.0 <= ratio <= 5.0:
+            _real_ctx_ratios[key] = ratio
+    return _real_ctx_overrides.get(key, 0)
+
+
+def get_real_context(endpoint_url: str, model: str) -> int:
+    return _real_ctx_overrides.get((endpoint_url, model), 0)
+
+
+def get_real_context_ratio(endpoint_url: str, model: str) -> float:
+    return _real_ctx_ratios.get((endpoint_url, model), 1.0)
+
+
 def _get_context_length_cached(endpoint_url: str, model: str) -> Tuple[int, bool]:
     """Return (context_length, known). ``known`` is False only when the value is a
     bare DEFAULT_CONTEXT fallback (no endpoint report and not in the known table)."""
@@ -250,6 +293,14 @@ def _get_context_length_cached(endpoint_url: str, model: str) -> Tuple[int, bool
     cache_key = (endpoint_url, model)
     if not is_local and cache_key in _context_cache:
         return _context_cache[cache_key]
+
+    # Local patch: a learned real window (from a backend
+    # exceed_context_size error) is ground truth -- it overrides the
+    # catalog claim, which may describe a different serving instance.
+    override = _real_ctx_overrides.get(cache_key)
+    if override:
+        logger.info(f"Using learned real context window for {model}: {override}")
+        return override, True
 
     ctx, known = _query_context_length(endpoint_url, model)
     # Only cache non-default values to allow retry on next request.
@@ -339,6 +390,12 @@ def _model_ctx_from_entry(m: dict) -> Optional[int]:
         # n_ctx is the actual serving context (set via -c flag in llama.cpp)
         for field in ("n_ctx", "context_length", "context_window", "max_model_len"):
             val = meta.get(field)
+            if val and isinstance(val, (int, float)) and val > 0:
+                return int(val)
+        # llama-swap nests its metadata one level deeper: meta.llamaswap.contextLength
+        llamaswap_meta = meta.get("llamaswap") or {}
+        if isinstance(llamaswap_meta, dict):
+            val = llamaswap_meta.get("contextLength")
             if val and isinstance(val, (int, float)) and val > 0:
                 return int(val)
     return None

@@ -24,10 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 class _Run:
-    __slots__ = ("buffer", "subscribers", "status", "task", "evict_task", "run_id")
+    __slots__ = ("buffer", "replay_seq", "subscribers", "status", "task", "evict_task", "run_id")
 
     def __init__(self) -> None:
-        self.buffer: list = []          # ordered SSE event strings (replay log)
+        self.buffer: list = []          # ordered SSE event strings (replay log, capped)
+        # 0-based index (in the original untrimmed stream) of the
+        # oldest event still in the buffer -- grows when the cap trims old events.
+        self.replay_seq: int = 0
         self.subscribers: set = set()   # one asyncio.Queue per connected client
         self.status: str = "running"    # running | done | error | stopped
         self.task: Optional[asyncio.Task] = None
@@ -45,14 +48,28 @@ _RUNS: Dict[str, _Run] = {}
 # it, every session that ever streamed kept its entire event log forever.
 _EVICT_GRACE_S = 180
 
+# Replay-buffer cap (events). An unbounded per-run log let a multi-hour
+# run's whole event stream be replayed to a reconnecting client; the cap
+# bounds both memory and reconnect replay size. Older events are already
+# persisted in the session's message history, so a partial replay is fine
+# -- the client fast-forwards it (replay_complete marker).
+_REPLAY_MAX_EVENTS = 2000
+
 
 def _publish(run: _Run, ev: str) -> None:
     """Append one SSE event and fan it out to every live subscriber."""
     run.buffer.append(ev)
+    overflow = len(run.buffer) - _REPLAY_MAX_EVENTS
+    if overflow > 0:
+        # Bounded memory: drop the oldest replay events. replay_seq
+        # tracks how many original events were dropped so subscribe()
+        # can mark the replay as partial.
+        del run.buffer[:overflow]
+        run.replay_seq += overflow
     seq = len(run.buffer) - 1
     for q in list(run.subscribers):
         try:
-            q.put_nowait((seq, ev))
+            q.put_nowait((run.replay_seq + seq, ev))
         except Exception:
             pass
 
@@ -220,9 +237,16 @@ async def subscribe(
         run.evict_task.cancel()
     try:
         next_seq = 0
+        if run.replay_seq > 0:
+            # Replay is partial (oldest events dropped to bound the
+            # buffer): tell the client so it can treat it as fast-forward.
+            yield 'event: replay_partial\ndata: {}\n\n'
         while next_seq < len(run.buffer):
             yield run.buffer[next_seq]
             next_seq += 1
+        # End of replay: everything after this marker is live. The client
+        # uses it to switch from fast-forward accumulation to rendering.
+        yield 'event: replay_complete\ndata: {}\n\n'
         if run.status != "running":
             return
         heartbeat_idx = 0

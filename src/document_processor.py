@@ -330,7 +330,15 @@ def _resolve_vl_model(configured: str, owner: str | None = None) -> tuple:
     raise ValueError("No vision model available")
 
 
-def analyze_image_with_vl_result(image_path: str, owner: str | None = None) -> dict:
+def _env_timeout(name: str, stock: int) -> int:
+    # Local patch: env-overridable read timeout for one LLM call site.
+    try:
+        return max(5, int(float(os.getenv(name, str(stock)))))
+    except (TypeError, ValueError):
+        return stock
+
+def analyze_image_with_vl_result(image_path: str, owner: str | None = None, prompt: str | None = None,
+                          no_thinking: bool = False, max_tokens: int | None = None) -> dict:
     """Analyze an image and return both text and the model that produced it."""
     logger.info(f"Analyzing image with VL model: {image_path}")
     try:
@@ -351,11 +359,15 @@ def analyze_image_with_vl_result(image_path: str, owner: str | None = None) -> d
         mime_map = {".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png", ".gif": "gif", ".webp": "webp"}
         img_format = mime_map.get(ext, "jpeg")
 
+        vl_text = prompt or "Describe this image in detail"
+        if no_thinking:
+            # Qwen3-style thinking switch-off, honored by llama.cpp for thinking models
+            vl_text = vl_text + "\n/no_think"
         vl_messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Describe this image in detail"},
+                    {"type": "text", "text": vl_text},
                     {"type": "image_url", "image_url": {"url": f"data:image/{img_format};base64,{img_data}"}},
                 ],
             }
@@ -372,7 +384,7 @@ def analyze_image_with_vl_result(image_path: str, owner: str | None = None) -> d
         last_err = None
         for i, (_url, _model, _headers) in enumerate([c for c in _vl_candidates if c and c[0] and c[1]]):
             try:
-                description = llm_call(_url, _model, vl_messages, headers=_headers, timeout=120)
+                description = llm_call(_url, _model, vl_messages, headers=_headers, timeout=_env_timeout('ODYSSEUS_TIMEOUT_VISION', 300), max_tokens=(max_tokens or 0))
                 logger.info("VL analysis complete with model %s", _model)
                 return {"text": description, "model": _model}
             except Exception as e:

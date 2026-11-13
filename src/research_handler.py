@@ -10,6 +10,7 @@ Includes a task registry so research survives page refreshes and can be cancelle
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -159,7 +160,7 @@ class ResearchHandler:
                 temperature=0.1,
                 max_tokens=200,
                 headers=llm_headers,
-                timeout=15,
+                timeout=self._env_timeout('ODYSSEUS_TIMEOUT_SYNTH_QUERY', 15),
                 max_retries=1,
             )
             query = strip_thinking(response).strip().strip('"\'')
@@ -186,7 +187,7 @@ class ResearchHandler:
                 temperature=0.3,
                 max_tokens=1024,
                 headers=llm_headers,
-                timeout=30,
+                timeout=self._env_timeout('ODYSSEUS_TIMEOUT_PLAN', 30),
                 max_retries=1,
             )
             response = strip_thinking(response)
@@ -243,7 +244,7 @@ class ResearchHandler:
         query: str,
         llm_endpoint: str,
         llm_model: str,
-        max_time: int = 300,
+        max_time: Optional[int] = None,
         hard_timeout: int = None,
         llm_headers: dict = None,
         on_complete: callable = None,
@@ -286,6 +287,18 @@ class ResearchHandler:
                     minimum=60,
                     maximum=86400,
                 )
+
+        # Local patch: max_time from settings when the caller didn't pin
+        # one (stock default was 300 s -- too short for slow local
+        # models). Tune via data/settings.json: research_max_time_seconds.
+        if max_time is None:
+            from src.settings import get_setting
+            max_time = _bounded_int(
+                get_setting('research_max_time_seconds', 600),
+                default=600,
+                minimum=60,
+                maximum=3600,
+            )
 
         # Cancel any existing research for this session
         if session_id in self._active_tasks:
@@ -716,8 +729,14 @@ class ResearchHandler:
             logger.error(f"Failed to unhide images: {e}")
             return False
 
-    @staticmethod
-    async def _probe_endpoint(endpoint: str, model: str, headers: dict = None):
+    def _env_timeout(self, name: str, stock: int) -> int:
+        # Local patch: env-overridable read timeout for one LLM call site.
+        try:
+            return max(5, int(float(os.getenv(name, str(stock)))))
+        except (TypeError, ValueError):
+            return stock
+
+    async def _probe_endpoint(self, endpoint: str, model: str, headers: dict = None):
         """Quick probe to verify the LLM endpoint/model responds before research."""
         from src.llm_core import llm_call_async
         try:
@@ -729,7 +748,7 @@ class ResearchHandler:
                 temperature=0,
                 max_tokens=5,
                 headers=headers,
-                timeout=15,
+                timeout=self._env_timeout('ODYSSEUS_TIMEOUT_PROBE', 15),
                 max_retries=1,
             )
             logger.info(f"Endpoint probe OK: {model}")
@@ -742,7 +761,7 @@ class ResearchHandler:
         query: str,
         llm_endpoint: str,
         llm_model: str,
-        max_time: int = 300,
+        max_time: Optional[int] = None,
         progress_callback=None,
         _task_entry: dict = None,
         llm_headers: dict = None,
@@ -762,7 +781,7 @@ class ResearchHandler:
             query: Research question
             llm_endpoint: LLM endpoint URL for chat completions
             llm_model: Model name/ID
-            max_time: Maximum research time in seconds (default 5 minutes)
+            max_time: Maximum research time in seconds (None = settings research_max_time_seconds)
             _task_entry: Internal - registry entry to store researcher ref
             prior_report: Previous report to continue from.
             prior_findings: Previous findings to build on.

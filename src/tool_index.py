@@ -7,6 +7,7 @@ relevant ones per user message.
 """
 
 import logging
+import os
 import hashlib
 import re
 import time
@@ -43,6 +44,19 @@ ALWAYS_AVAILABLE = frozenset({
     # Write back to the active plan (tick steps done / revise) during execution.
     "update_plan",
 })
+# Local patch: always-on tools from the environment. Comma-separated
+# tool names (e.g. ODYSSEUS_ALWAYS_TOOLS=bash,python) are UNIONED into
+# ALWAYS_AVAILABLE so they are sent to the model every turn instead of
+# only when retrieval happens to pick them. Unknown names are simply
+# ignored (prompt/schema assembly filters to registered tools).
+# Default "bash" keeps the shell tool always accessible. The env var is
+# read at import time, so change it in .env and `docker compose up -d`
+# (no image rebuild needed for a different selection).
+_ALWAYS_FROM_ENV = os.getenv("ODYSSEUS_ALWAYS_TOOLS", "bash")
+_env_always = frozenset(
+    t.strip() for t in _ALWAYS_FROM_ENV.split(",") if t.strip()
+)
+ALWAYS_AVAILABLE = ALWAYS_AVAILABLE | _env_always
 
 # Tools that the Personal Assistant always has access to during scheduled
 # check-ins and proactive tasks, in addition to RAG-selected tools.
@@ -71,6 +85,7 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "python": "Execute Python code for computation, data processing, math, scripting, and parsing. Not for writing code for the user. Prefer a dedicated tool for reading, writing, or searching files; use python only for what no dedicated tool covers. Do not use for web lookup/search; use web_search or web_fetch when web tools are available.",
     "web_search": "Quick single web lookup for a fact, current event, latest/current information, or doc mid-task. Use this instead of bash/curl/python/requests for web searches. NOT for 'research X' / 'do research on X' requests — those are deep-research jobs (use trigger_research). web_search = one query; trigger_research = a full researched report in the sidebar.",
     "web_fetch": "Fetch and read the text content of a specific URL/website the user names (e.g. 'check example.com', 'open this link'). Use when you have a concrete URL; for open-ended lookups use web_search instead.",
+    "vision": "Analyze an image on disk (screenshot, diagram, photo, chart) with the configured vision model and return its description. Use when the model must SEE or reason about an image's contents -- circuit screenshots, rendered diagrams, plots, attached photos. Optional focus prompt. Distinct from read_file (text) and from the automatic chat-attachment pre-pass, which gives only one generic description.",
     "read_file": "Read a file from disk and return its contents. View source code, config files, logs. Supports an optional line range (offset/limit) for large files.",
     "grep": "Search file CONTENTS for a regex across a directory tree (ripgrep-backed, honours .gitignore). Returns file:line:match. Use to find where code/symbols/strings live — prefer over bash grep.",
     "glob": "Find FILES by glob pattern (e.g. '**/*.py'), newest first. Use to locate files by name/extension — prefer over bash find/ls.",

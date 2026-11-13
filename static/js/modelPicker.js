@@ -650,6 +650,9 @@ async function _pick(m) {
         endpoint_id: m.endpointId || '',
         display: m.display || m.mid || '',
         picked_at: Date.now(),
+        // Scope this memory to the chat it was picked for — a window-global pick
+        // must never leak into a different chat's send target.
+        session_id: (_deps.getCurrentSessionId && _deps.getCurrentSessionId()) || '',
       };
     } catch (_) {}
     let switchDone = null;

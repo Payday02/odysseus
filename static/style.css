@@ -2231,6 +2231,12 @@ body.bg-pattern-sparkles {
       margin-top: 8px;
       margin-bottom: 8px;
     }
+    /* Markdown images: constrain to bubble width so wide images (e.g.
+       rendered diagrams) don't overflow and get clipped by .msg .body */
+    .msg .body img {
+      max-width: 100%;
+      height: auto;
+    }
     .msg .body > *:first-child {
       margin-top: 0;
     }

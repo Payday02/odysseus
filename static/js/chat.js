@@ -469,9 +469,14 @@ import { loadPanel } from './panels.js';
       if (pending && pending.modelId) return pending.modelId;
     } catch (_) {}
     try {
+      // Last-picked fallback: honor only for a fresh chat (no session) or a pick
+      // that belongs to this session — never a stale pick from a different chat.
       const lastPicked = window.__odysseusLastPickedRoute || null;
       if (lastPicked && lastPicked.model && Date.now() - (lastPicked.picked_at || 0) < 10 * 60 * 1000) {
-        return lastPicked.model;
+        const curSid = sessionModule.getCurrentSessionId ? (sessionModule.getCurrentSessionId() || '') : '';
+        if (!curSid || !lastPicked.session_id || lastPicked.session_id === curSid) {
+          return lastPicked.model;
+        }
       }
     } catch (_) {}
     if (routeSnapshot && routeSnapshot.model) return routeSnapshot.model;
@@ -1330,13 +1335,16 @@ import { loadPanel } from './panels.js';
 
     const selectedRouteForSend = (() => {
       try {
-        const lastPicked = window.__odysseusLastPickedRoute || null;
-        if (lastPicked && lastPicked.model && Date.now() - (lastPicked.picked_at || 0) < 10 * 60 * 1000) {
+        // 1) The open chat's own model — ground truth for which model this chat uses.
+        //    (Model picks update the session model synchronously, so it is always
+        //    fresher than any global "last picked" memory.)
+        const curModel = sessionModule.getCurrentModel ? (sessionModule.getCurrentModel() || '') : '';
+        if (curModel) {
           return {
-            model: lastPicked.model || '',
-            endpoint_url: lastPicked.endpoint_url || '',
-            endpoint_id: lastPicked.endpoint_id || '',
-            source: 'last-picked',
+            model: curModel,
+            endpoint_url: sessionModule.getCurrentEndpointUrl ? (sessionModule.getCurrentEndpointUrl() || '') : '',
+            endpoint_id: '',
+            source: 'session',
           };
         }
         const pending = sessionModule.getPendingChat && sessionModule.getPendingChat();
@@ -1348,12 +1356,22 @@ import { loadPanel } from './panels.js';
             source: pending.source || '',
           };
         }
-        return {
-          model: sessionModule.getCurrentModel ? (sessionModule.getCurrentModel() || '') : '',
-          endpoint_url: sessionModule.getCurrentEndpointUrl ? (sessionModule.getCurrentEndpointUrl() || '') : '',
-          endpoint_id: '',
-          source: '',
-        };
+        // 2) Last-picked fallback — honored only for a fresh chat (no session yet)
+        //    or a pick that belongs to THIS session. A stale pick from a different
+        //    chat must never override where this chat sends.
+        const lastPicked = window.__odysseusLastPickedRoute || null;
+        if (lastPicked && lastPicked.model && Date.now() - (lastPicked.picked_at || 0) < 10 * 60 * 1000) {
+          const curSid = sessionModule.getCurrentSessionId ? (sessionModule.getCurrentSessionId() || '') : '';
+          if (!curSid || !lastPicked.session_id || lastPicked.session_id === curSid) {
+            return {
+              model: lastPicked.model || '',
+              endpoint_url: lastPicked.endpoint_url || '',
+              endpoint_id: lastPicked.endpoint_id || '',
+              source: 'last-picked',
+            };
+          }
+        }
+        return { model: '', endpoint_url: '', endpoint_id: '', source: '' };
       } catch (_) {
         return { model: '', endpoint_url: '', endpoint_id: '', source: '' };
       }
@@ -2868,7 +2886,7 @@ import { loadPanel } from './panels.js';
                 if (spinner && spinner.element) spinner.destroy();
                 break;
               }
-              if (json.delta || json.type === 'agent_prep' || json.type === 'tool_approval_resolved' || json.type === 'generated_image' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
+              if (json.delta || json.type === 'agent_prep' || json.type === 'tool_approval_resolved' || json.type === 'generated_image' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress' || json.type === 'stream_keepalive') {
                 clearResponseTimeout();
                 clearProcessingProbe();
                 clearFirstTokenWaitTimers();
@@ -2882,6 +2900,16 @@ import { loadPanel } from './panels.js';
                 if (!_isBg) {
                   _cancelThinkingTimer();
                   _replaceThinkingSpinner('Preparing agent');
+                }
+                continue;
+              }
+              if (json.type === 'stream_keepalive') {
+                // Local patch: prefill heartbeat from the server -- the model
+                // is alive but has emitted no tokens yet (large-context
+                // pre-fill). Keeps the spinner honest so a 5-10 minute prefill
+                // does not look like a frozen tab.
+                if (spinner && spinner.element && !roundText) {
+                  spinner.updateMessage('Model is pre-filling context - no tokens yet. Large contexts can take several minutes.');
                 }
                 continue;
               }
@@ -4995,6 +5023,7 @@ import { loadPanel } from './panels.js';
     let roundText = '';
     let docFenceOpened = false;
     let gotDelta = false;
+    let fastForward = true;   // replay fast-forward until the replay_complete marker
     let leftSession = false;
     let metricsData = null;
     let replayError = null;
@@ -5044,18 +5073,34 @@ import { loadPanel } from './panels.js';
             try { await reader.cancel(); } catch (_) {}
             break readLoop;
           }
+          if (part.split('\n').some(l => l.trim() === 'event: replay_complete')) {
+            // End of (possibly partial) buffer replay: render the accumulated
+            // round once, then switch to normal per-token rendering.
+            if (fastForward) { fastForward = false; renderDelta(); }
+            continue;
+          }
           let json;
           try { json = JSON.parse(payload); } catch (_) { continue; }
           if (eventIsError) {
             replayError = createTerminalStreamError(json);
           } else if (json.delta) {
             roundText += json.delta;
-            if (!docFenceOpened && (roundText.includes('```create_document\n') || roundText.includes('```document\n') || roundText.includes('```documen\n'))) {
-              docFenceOpened = true;
-              rich = true;
-            }
             if (!gotDelta) { gotDelta = true; try { spinner.destroy(); } catch (_) {} }
-            renderDelta();
+            if (fastForward) {
+              // Replay fast-forward: accumulate without re-rendering every token --
+              // re-parsing the whole round per token was O(n^2) and froze the
+              // tab on long replays. One full render happens at replay_complete.
+              if (!contentDiv.innerHTML) contentDiv.innerHTML = '<div style="opacity:.6;font-style:italic">Catching up with the running response...</div>';
+              if (!docFenceOpened && roundText.length % 8192 < json.delta.length) {
+                if (roundText.includes('```create_document\n') || roundText.includes('```document\n') || roundText.includes('```documen\n')) { docFenceOpened = true; rich = true; }
+              }
+            } else {
+              if (!docFenceOpened && (roundText.includes('```create_document\n') || roundText.includes('```document\n') || roundText.includes('```documen\n'))) {
+                docFenceOpened = true;
+                rich = true;
+              }
+              renderDelta();
+            }
           } else if (json.type === 'doc_stream_open') {
             rich = true;
             if (documentModule) documentModule.streamDocOpen(json.title || '', json.lang || '');
